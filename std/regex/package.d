@@ -449,239 +449,6 @@ public enum ctRegex(alias pattern, alias flags=[]) = ctRegexImpl!(pattern, flags
 enum isRegexFor(RegEx, R) = is(RegEx == Regex!(BasicElementOf!R))
      || is(RegEx == StaticRegex!(BasicElementOf!R));
 
-
-/++
-    $(D Captures) object contains submatches captured during a call
-    to $(D match) or iteration over $(D RegexMatch) range.
-
-    First element of range is the whole match.
-+/
-@trusted public struct Captures(R, DIndex = size_t)
-if (isSomeString!R)
-{//@trusted because of union inside
-    alias DataIndex = DIndex;
-    alias String = R;
-private:
-    import std.conv : text;
-    R _input;
-    int _nMatch;
-    enum smallString = 3;
-    enum SMALL_MASK = 0x8000_0000, REF_MASK= 0x1FFF_FFFF;
-    union
-    {
-        Group!DataIndex[] big_matches;
-        Group!DataIndex[smallString] small_matches;
-    }
-    uint _f, _b;
-    uint _refcount; // ref count or SMALL MASK + num groups
-    NamedGroup[] _names;
-
-    this()(R input, uint n, NamedGroup[] named)
-    {
-        _input = input;
-        _names = named;
-        newMatches(n);
-        _b = n;
-        _f = 0;
-    }
-
-    this(alias Engine)(ref RegexMatch!(R,Engine) rmatch)
-    {
-        _input = rmatch._input;
-        _names = rmatch._engine.re.dict;
-        immutable n = rmatch._engine.re.ngroup;
-        newMatches(n);
-        _b = n;
-        _f = 0;
-    }
-
-    @property inout(Group!DataIndex[]) matches() inout
-    {
-       return (_refcount & SMALL_MASK)  ? small_matches[0 .. _refcount & 0xFF] : big_matches;
-    }
-
-    void newMatches(uint n)
-    {
-        import core.stdc.stdlib : calloc;
-        import std.exception : enforce;
-        if (n > smallString)
-        {
-            auto p = cast(Group!DataIndex*) enforce(
-                calloc(Group!DataIndex.sizeof,n),
-                "Failed to allocate Captures struct"
-            );
-            big_matches = p[0 .. n];
-            _refcount = 1;
-        }
-        else
-        {
-            _refcount = SMALL_MASK | n;
-        }
-    }
-
-    bool unique()
-    {
-        return (_refcount & SMALL_MASK) || _refcount == 1;
-    }
-
-public:
-    this(this)
-    {
-        if (!(_refcount & SMALL_MASK))
-        {
-            _refcount++;
-        }
-    }
-    ~this()
-    {
-        import core.stdc.stdlib : free;
-        if (!(_refcount & SMALL_MASK))
-        {
-            if (--_refcount == 0)
-            {
-                free(big_matches.ptr);
-                big_matches = null;
-            }
-        }
-    }
-    ///Slice of input prior to the match.
-    @property R pre()
-    {
-        return _nMatch == 0 ? _input[] : _input[0 .. matches[0].begin];
-    }
-
-    ///Slice of input immediately after the match.
-    @property R post()
-    {
-        return _nMatch == 0 ? _input[] : _input[matches[0].end .. $];
-    }
-
-    ///Slice of matched portion of input.
-    @property R hit()
-    {
-        assert(_nMatch);
-        return _input[matches[0].begin .. matches[0].end];
-    }
-
-    ///Range interface.
-    @property R front()
-    {
-        assert(_nMatch);
-        return _input[matches[_f].begin .. matches[_f].end];
-    }
-
-    ///ditto
-    @property R back()
-    {
-        assert(_nMatch);
-        return _input[matches[_b - 1].begin .. matches[_b - 1].end];
-    }
-
-    ///ditto
-    void popFront()
-    {
-        assert(!empty);
-        ++_f;
-    }
-
-    ///ditto
-    void popBack()
-    {
-        assert(!empty);
-        --_b;
-    }
-
-    ///ditto
-    @property bool empty() const { return _nMatch == 0 || _f >= _b; }
-
-    ///ditto
-    inout(R) opIndex()(size_t i) inout
-    {
-        assert(_f + i < _b,text("requested submatch number ", i," is out of range"));
-        assert(matches[_f + i].begin <= matches[_f + i].end,
-            text("wrong match: ", matches[_f + i].begin, "..", matches[_f + i].end));
-        return _input[matches[_f + i].begin .. matches[_f + i].end];
-    }
-
-    /++
-        Explicit cast to bool.
-        Useful as a shorthand for !(x.empty) in if and assert statements.
-
-        ---
-        import std.regex;
-
-        assert(!matchFirst("nothing", "something"));
-        ---
-    +/
-
-    @safe bool opCast(T:bool)() const nothrow { return _nMatch != 0; }
-
-    /++
-        Number of pattern matched counting, where 1 - the first pattern.
-        Returns 0 on no match.
-    +/
-
-    @safe @property int whichPattern() const nothrow { return _nMatch; }
-
-    ///
-    @system unittest
-    {
-        import std.regex;
-        assert(matchFirst("abc", "[0-9]+", "[a-z]+").whichPattern == 2);
-    }
-
-    /++
-        Lookup named submatch.
-
-        ---
-        import std.regex;
-        import std.range;
-
-        auto c = matchFirst("a = 42;", regex(`(?P<var>\w+)\s*=\s*(?P<value>\d+);`));
-        assert(c["var"] == "a");
-        assert(c["value"] == "42");
-        popFrontN(c, 2);
-        //named groups are unaffected by range primitives
-        assert(c["var"] =="a");
-        assert(c.front == "42");
-        ----
-    +/
-    R opIndex(String)(String i) /*const*/ //@@@BUG@@@
-        if (isSomeString!String)
-    {
-        size_t index = lookupNamedGroup(_names, i);
-        return _input[matches[index].begin .. matches[index].end];
-    }
-
-    ///Number of matches in this object.
-    @property size_t length() const { return _nMatch == 0 ? 0 : _b - _f;  }
-
-    ///A hook for compatibility with original std.regex.
-    @property ref captures(){ return this; }
-}
-
-///
-@system unittest
-{
-    import std.range.primitives : popFrontN;
-
-    auto c = matchFirst("@abc#", regex(`(\w)(\w)(\w)`));
-    assert(c.pre == "@"); // Part of input preceding match
-    assert(c.post == "#"); // Immediately after match
-    assert(c.hit == c[0] && c.hit == "abc"); // The whole match
-    assert(c[2] == "b");
-    assert(c.front == "abc");
-    c.popFront();
-    assert(c.front == "a");
-    assert(c.back == "c");
-    c.popBack();
-    assert(c.back == "b");
-    popFrontN(c, 2);
-    assert(c.empty);
-
-    assert(!matchFirst("nothing", "something"));
-}
-
 /++
     A regex engine state, as returned by $(D match) family of functions.
 
@@ -698,18 +465,33 @@ private:
     import core.stdc.stdlib : malloc, free;
     alias Char = BasicElementOf!R;
     alias EngineType = Engine!Char;
+    alias MatcherAllocatorType = MatcherAllocator!(Char, Engine);
     EngineType _engine;
     R _input;
     Captures!(R,EngineType.DataIndex) _captures;
     void[] _memory;//is ref-counted
+    MatcherAllocatorType* _allocator;
 
     this(RegEx)(R input, RegEx prog)
     {
         import std.exception : enforce;
         _input = input;
-        immutable size = EngineType.initialMemory(prog)+size_t.sizeof;
-        _memory = (enforce(malloc(size), "malloc failed")[0 .. size]);
-        scope(failure) free(_memory.ptr);
+        static if ( is( EngineType == typeof(prog.memory.forMatchers).MatcherType ) )
+        {
+            // Fast thread-friendly freelist allocation.
+            _allocator = re.memory.forMatchers;
+            void[] _memory = enforce(_allocator.allocate(),
+                "allocation failed : _allocator returned null");
+            assert(_memory.length >= EngineType.initialMemory(prog)+size_t.sizeof);
+            scope(failure) _allocator.deallocate(_memory);
+        }
+        else
+        {
+            _allocator = null;
+            immutable size = EngineType.initialMemory(prog)+size_t.sizeof;
+            _memory = (enforce(malloc(size), "malloc failed")[0 .. size]);
+            scope(failure) free(_memory.ptr);
+        }
         *cast(size_t*)_memory.ptr = 1;
         _engine = EngineType(prog, Input!Char(input), _memory[size_t.sizeof..$]);
         static if (is(RegEx == StaticRegex!(BasicElementOf!R)))
@@ -737,7 +519,11 @@ public:
         {
             debug(std_regex_allocation) writefln("RefCount (dtor): %x %d",
                 _memory.ptr, *cast(size_t*)_memory.ptr);
-            free(cast(void*)_memory.ptr);
+
+            if ( _allocator )
+                _allocator.deallocate(_memory);
+            else
+                free(cast(void*)_memory.ptr);
         }
     }
 
@@ -783,16 +569,28 @@ public:
         if (counter != 1)
         {//do cow magic first
             counter--;//we abandon this reference
-            immutable size = EngineType.initialMemory(_engine.re)+size_t.sizeof;
-            _memory = (enforce(malloc(size), "malloc failed")[0 .. size]);
-            _engine = _engine.dupTo(_memory[size_t.sizeof .. size]);
+
+            if ( _allocator )
+            {
+                // Fast thread-friendly freelist allocation.
+                void[] _memory = enforce(_allocator.allocate(),
+                    "allocation failed : _allocator returned null");
+                assert(_memory.length >= EngineType.initialMemory(_engine.re)+size_t.sizeof);
+                _engine = _engine.dupTo(_memory[size_t.sizeof .. $]);
+            }
+            else
+            {
+                immutable size = EngineType.initialMemory(_engine.re)+size_t.sizeof;
+                _memory = (enforce(malloc(size), "malloc failed")[0 .. size]);
+                _engine = _engine.dupTo(_memory[size_t.sizeof .. size]);
+            }
             counter = 1;//points to new chunk
         }
 
         if (!_captures.unique)
         {
             // has external references - allocate new space
-            _captures.newMatches(_engine.re.ngroup);
+            _captures.newMatches(_engine.re);
         }
         _captures._nMatch = _engine.match(_captures.matches);
     }
@@ -818,10 +616,31 @@ private @trusted auto matchOnce(alias Engine, RegEx, R)(R input, RegEx re)
     alias Char = BasicElementOf!R;
     alias EngineType = Engine!Char;
 
-    size_t size = EngineType.initialMemory(re);
-    void[] memory = enforce(malloc(size), "malloc failed")[0 .. size];
-    scope(exit) free(memory.ptr);
-    auto captures = Captures!(R, EngineType.DataIndex)(input, re.ngroup, re.dict);
+    assert(re.memory !is null);
+
+    static if ( is( EngineType == typeof(re.memory.forMatchers).MatcherType ) )
+    {
+        // Fast thread-friendly freelist allocation.
+        void[] _memory = enforce(re.memory.forMatchers.allocate(),
+            "allocation failed : re.memory.forMatchers returned null");
+        assert(memory.length >= EngineType.initialMemory(re));
+        scope(exit) re.memory.forMatchers.deallocate(memory);
+    }
+    else
+    {
+        // The caller ordered something that wasn't on the menu.
+        // Now we have to use a slower and possibly not-thread-friendly
+        // allocator. (As of 2017-07-01, on Windows 10, calling malloc
+        // can kill multithreading performance when called frequently;
+        // perhaps it is using a global lock.  It also pessimizes serial
+        // performance considerably if matchOnce is called frequently on
+        // small input strings.)
+        size_t size = EngineType.initialMemory(re);
+        void[] memory = enforce(malloc(size), "malloc failed")[0 .. size];
+        scope(exit) free(memory.ptr);
+    }
+
+    auto captures = Captures!(R, EngineType.DataIndex)(input, re);
     auto engine = EngineType(re, Input!Char(input), memory);
     static if (is(RegEx == StaticRegex!(BasicElementOf!R)))
         engine.nativeFn = re.nativeFn;
@@ -999,6 +818,28 @@ if (isSomeString!R && is(RegEx == StaticRegex!(BasicElementOf!R)))
 {
     import std.regex.internal.backtracking : BacktrackingMatcher;
     return matchOnce!(BacktrackingMatcher!true)(input, re);
+}
+
+///
+@system unittest
+{
+    import std.range.primitives : popFrontN;
+
+    auto c = matchFirst("@abc#", regex(`(\w)(\w)(\w)`));
+    assert(c.pre == "@"); // Part of input preceding match
+    assert(c.post == "#"); // Immediately after match
+    assert(c.hit == c[0] && c.hit == "abc"); // The whole match
+    assert(c[2] == "b");
+    assert(c.front == "abc");
+    c.popFront();
+    assert(c.front == "a");
+    assert(c.back == "c");
+    c.popBack();
+    assert(c.back == "b");
+    popFrontN(c, 2);
+    assert(c.empty);
+
+    assert(!matchFirst("nothing", "something"));
 }
 
 /++

@@ -514,6 +514,12 @@ struct Regex(Char)
 
 package(std.regex):
     import std.regex.internal.kickstart : Kickstart; //TODO: get rid of this dependency
+    import std.regex.internal.thompson : ThompsonMatcher;
+
+    // Anything adhering to the Regex interface must provide a Matcher alias.
+    // This allows for simple and fast memory preallocation.
+    alias Matcher = ThompsonMatcher;
+
     NamedGroup[] dict;                     // maps name -> user group number
     uint ngroup;                           // number of internal groups
     uint maxCounterDepth;                  // max depth of nested {n,m} repetitions
@@ -524,6 +530,29 @@ package(std.regex):
     public const(BitTable)[] filters;      // bloom filters for conditional loops
     uint[] backrefed;                      // bit array of backreferenced submatches
     Kickstart!Char kickstart;
+    RegexMemory!(Char,Matcher) memory;
+
+    this(this)
+    {
+        // Compile-time instances of Regex cannot allocate the RegexMemory
+        // object; it is not allowed as part of a struct literal used to
+        // define an enum constant.  If we left it at that, then those instances
+        // would get copied into runtime variables with a null RegexMemory
+        // object, and it would probably stay that way because Regex instances
+        // are typically passed by value (lazy allocation of RegexMemory would
+        // cause a copy of a Regex instance to obtain a RegexMemory object, but
+        // the original Regex struct would still have null, and the copy's
+        // RegexMemory object would be lost as soon as its enclosing function
+        // exits or it otherwise goes out of scope).  The recycle-regex-memory
+        // optimization would thus be subverted.
+        //
+        // We can get around this by using the postblit to construct a
+        // RegexMemory object as soon as a Regex object hits runtime.
+        //
+        static if ( !__ctfe )
+            if ( memory is null )
+                memory = new RegexMemory(this);
+    }
 
     //bit access helper
     uint isBackref(uint n)
@@ -584,6 +613,115 @@ public:
 
     }
 
+}
+
+// $(D RegexMemory) holds all memory allocated by a $(D Regex) instance
+// to handle recurrent tasks, such as $(REF _stripLeft, std, regex, matchFirst).
+// The object itself is allocated greedily, while the memory held in this
+// object is allocated lazily.  The memory held in this object is only
+// deallocated when this object is garbage-collected (ex: the Regex is no
+// longer referenced anywhere).
+package(std.regex)
+final class RegexMemory(Char, alias Matcher)
+{
+    import std.experimental.allocator.building_blocks.free_list : SharedFreeList;
+
+    alias MatcherAllocatorType = MatcherAllocator!(Char,Matcher);
+    private MatcherAllocatorType  _forMatchers;
+    @property MatcherAllocatorType*  forMatchers() { return &_forMatchers; }
+
+    alias DataIndex = MatcherAllocatorType.MatcherType.DataIndex;
+
+    alias CaptureAllocatorType = CaptureAllocator!(Char[],DataIndex);
+    private CaptureAllocatorType  _forCaptures;
+    @property CaptureAllocatorType*  forCaptures() { return &_forCaptures; }
+
+    this(RegEx)(const ref RegEx re)
+    {
+        alias MatcherT = MatcherAllocatorType.MatcherType;
+        alias CaptureT = CaptureAllocatorType.CaptureType;
+
+        immutable matcherSize = MatcherT.initialMemory(re)+size_t.sizeof;
+        _forMatchers.freeList.setBounds(matcherSize, matcherSize);
+
+        immutable captureSize = CaptureT.initialMemory(re);
+        _forCaptures.freeList.setBounds(captureSize, captureSize);
+    }
+}
+
+// The $(D RegexFixedAllocator) struct represents a portion of a $(D RegexMemory)
+// object that can be referenced individually from other places in the regex
+// package.  If other regex allocators ever come into being, this one can be
+// distinguished as performing fixed-size allocations very efficiently
+// (such as by using a free list).
+package(std.regex)
+struct RegexFixedAllocator
+{
+    import std.experimental.allocator.building_blocks.free_list : SharedFreeList;
+    import std.experimental.allocator.common : chooseAtRuntime;
+    import std.experimental.allocator.mallocator : Mallocator;
+
+    private shared SharedFreeList!(Mallocator, chooseAtRuntime, chooseAtRuntime) freeList;
+
+    debug(std_regex_allocation)
+        private size_t allocationCount = 0;
+
+    ~this()
+    {
+        // All blocks must be deallocated before we call minimize(), because
+        // minimize() will only free memory that is marked unused by the
+        // free list.  If any memory is still kicking around outside of the
+        // free list, it will be leaked, so we want that quantity to be zero.
+        debug(std_regex_allocation)
+            assert(allocationCount == 0);
+
+        // Return memory to the mallocator.
+        freeList.minimize();
+    }
+
+    // Disable the postblit so that noone accidentally copies an instance of
+    // this struct.  This struct is intended to represent part of the layout
+    // of a RegexMemory object and have a lifetime that exactly matches its
+    // parent RegexMemory object.  Copying semantics could cause ctors/dtors
+    // to run too many times or at the wrong times (e.g.: not when RegexMemory
+    // is being constructed/destructed).  Free free to change this if you need
+    // to and are really confident, otherwise, please keep it simple.
+    @disable this(this);
+
+    void[] allocate()
+    {
+        debug(std_regex_allocation)
+            allocationCount++;
+        return freeList.allocate(freeList.max);
+    }
+
+    bool deallocate(void[] memory)
+    {
+        debug(std_regex_allocation) {
+            assert(allocationCount > 0);
+            debug allocationCount--;
+        }
+        return freeList.deallocate(memory);
+    }
+}
+
+package(std.regex)
+struct CaptureAllocator(String, DataIndex)
+    if ( isSomeString!String )
+{
+    alias CaptureType = Capture!(R, DIndex);
+
+    RegexFixedAllocator  _this;
+    alias _this this;
+}
+
+package(std.regex)
+struct MatcherAllocator(Char, alias Matcher)
+{
+    alias MatcherType = Matcher!Char;
+
+    RegexFixedAllocator  _this;
+    alias _this this;
 }
 
 // The stuff below this point is temporarrily part of IR module

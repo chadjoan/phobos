@@ -24,6 +24,7 @@ auto makeRegex(S, CG)(Parser!(S, CG) p)
         charsets = g.charsets;
         matchers = g.matchers;
         backrefed = g.backrefed;
+        __ctfe || memory = new RegexMemory(re);
         re.postprocess();
         debug(std_regex_parser)
         {
